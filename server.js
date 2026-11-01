@@ -1,3 +1,4 @@
+
 'use strict';
 
 const express = require('express');
@@ -15,15 +16,14 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
-const SESSION_SECRET = process.env.SESSION_SECRET;
 
 if (process.env.NODE_ENV === 'production' && !DATABASE_URL) {
-  console.error('ERROR: DATABASE_URL is missing. Add your Render PostgreSQL Internal Database URL.');
+  console.error('DATABASE_URL is missing.');
   process.exit(1);
 }
 
-if (process.env.NODE_ENV === 'production' && !SESSION_SECRET) {
-  console.error('ERROR: SESSION_SECRET is missing. Set a long random secret in Render environment variables.');
+if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+  console.error('SESSION_SECRET is missing.');
   process.exit(1);
 }
 
@@ -49,7 +49,7 @@ app.use(session({
     tableName: 'session',
     createTableIfMissing: true
   }),
-  secret: SESSION_SECRET || 'development-only-change-this-secret',
+  secret: process.env.SESSION_SECRET || 'development-only-secret',
   resave: false,
   saveUninitialized: false,
   cookie: {
@@ -83,15 +83,14 @@ const upload = multer({
 });
 
 function cleanText(value, max = 500) {
-  return String(value || '').trim().slice(0, max);
+  return String(value ?? '').trim().slice(0, max);
 }
 
 function getIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
-  const ip = forwarded
-    ? String(forwarded).split(',')[0].trim()
-    : req.socket.remoteAddress || '';
-  return ip.slice(0, 100);
+  return String(
+    forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress || ''
+  ).slice(0, 100);
 }
 
 function asyncRoute(fn) {
@@ -101,11 +100,9 @@ function asyncRoute(fn) {
 
 async function hasColumn(table, column) {
   const result = await pool.query(
-    `SELECT 1
-     FROM information_schema.columns
+    `SELECT 1 FROM information_schema.columns
      WHERE table_schema = current_schema()
-       AND table_name = $1
-       AND column_name = $2`,
+       AND table_name = $1 AND column_name = $2`,
     [table, column]
   );
   return result.rowCount > 0;
@@ -113,13 +110,15 @@ async function hasColumn(table, column) {
 
 async function addColumn(table, column, definition) {
   if (!await hasColumn(table, column)) {
-    await pool.query(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`);
-    console.log(`Database migration: added ${table}.${column}`);
+    await pool.query(
+      `ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition}`
+    );
+    console.log(`Added database column: ${table}.${column}`);
   }
 }
 
 async function initDb() {
-  console.log('Checking PostgreSQL database...');
+  console.log('Initializing database...');
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -135,7 +134,6 @@ async function initDb() {
     )
   `);
 
-  // Automatically repair older users tables.
   await addColumn('users', 'username', 'VARCHAR(40)');
   await addColumn('users', 'password_hash', 'TEXT');
   await addColumn('users', 'display_name', 'VARCHAR(60)');
@@ -146,21 +144,14 @@ async function initDb() {
   await addColumn('users', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()');
 
   await pool.query(`
-    UPDATE users
-    SET display_name = username
+    UPDATE users SET display_name = username
     WHERE display_name IS NULL OR display_name = ''
   `);
-
   await pool.query(`
-    UPDATE users
-    SET role = 'user'
-    WHERE role IS NULL OR role = ''
+    UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''
   `);
-
   await pool.query(`
-    UPDATE users
-    SET is_banned = FALSE
-    WHERE is_banned IS NULL
+    UPDATE users SET is_banned = FALSE WHERE is_banned IS NULL
   `);
 
   await pool.query(`
@@ -176,7 +167,6 @@ async function initDb() {
     )
   `);
 
-  // Automatically repair older posts tables.
   await addColumn('posts', 'user_id', 'INTEGER');
   await addColumn('posts', 'title', 'VARCHAR(160)');
   await addColumn('posts', 'content', 'TEXT');
@@ -185,9 +175,8 @@ async function initDb() {
   await addColumn('posts', 'is_official', 'BOOLEAN DEFAULT FALSE');
   await addColumn('posts', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()');
 
-  await pool.query(`
-    UPDATE posts SET tags = '{}' WHERE tags IS NULL
-  `);
+  await pool.query(`UPDATE posts SET tags = '{}' WHERE tags IS NULL`);
+  await pool.query(`UPDATE posts SET content = '' WHERE content IS NULL`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS announcements (
@@ -228,67 +217,94 @@ async function initDb() {
 
   await pool.query(`
     CREATE INDEX IF NOT EXISTS posts_created_at_idx
-    ON posts (created_at DESC)
+    ON posts(created_at DESC)
   `);
 
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS posts_user_id_idx
-    ON posts (user_id)
-  `);
-
-  console.log('Database ready. Existing data has been preserved.');
+  console.log('Database initialization completed.');
 }
 
-async function getUser(userId) {
-  const result = await pool.query(
-    `SELECT id, username, display_name, avatar, bio, role, is_banned, created_at
-     FROM users WHERE id = $1`,
-    [userId]
-  );
-  return result.rows[0] || null;
+function userForFrontend(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.display_name,
+    display_name: user.display_name,
+    avatar: user.avatar,
+    bio: user.bio,
+    role: user.role,
+    isAdmin: user.role === 'admin',
+    is_banned: user.is_banned
+  };
 }
 
 async function requireLogin(req, res, next) {
-  if (!req.session.userId) {
-    return res.status(401).json({ error: 'Please log in first.' });
+  try {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: 'Please sign in first.' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, username, display_name, avatar, bio,
+              role, is_banned, created_at
+       FROM users WHERE id = $1`,
+      [req.session.userId]
+    );
+
+    const user = result.rows[0];
+
+    if (!user || user.is_banned) {
+      req.session.destroy(() => {});
+      return res.status(403).json({ error: 'Account unavailable.' });
+    }
+
+    req.user = user;
+    next();
+  } catch (err) {
+    next(err);
   }
-
-  const user = await getUser(req.session.userId);
-
-  if (!user || user.is_banned) {
-    req.session.destroy(() => {});
-    return res.status(403).json({ error: 'This account is unavailable.' });
-  }
-
-  req.user = user;
-  next();
 }
 
-async function requireAdmin(req, res, next) {
-  await requireLogin(req, res, async () => {
-    if (!req.user || req.user.role !== 'admin') {
+function requireAdmin(req, res, next) {
+  requireLogin(req, res, () => {
+    if (req.user.role !== 'admin') {
       return res.status(403).json({ error: 'Administrator access required.' });
     }
     next();
   });
 }
 
-const maintenanceExempt = [
-  '/api/health',
-  '/api/auth/login',
-  '/api/auth/register'
-];
-
+// Check IP bans and maintenance mode.
 app.use(asyncRoute(async (req, res, next) => {
-  if (!req.path.startsWith('/api/') || maintenanceExempt.includes(req.path)) {
+  if (!req.path.startsWith('/api/') || req.path === '/api/health') {
     return next();
+  }
+
+  const ip = getIp(req);
+  const banned = await pool.query(
+    'SELECT id FROM banned_ips WHERE ip = $1',
+    [ip]
+  );
+
+  if (banned.rowCount) {
+    return res.status(403).json({ error: 'Access denied.' });
   }
 
   const setting = await pool.query(
     `SELECT value FROM site_settings WHERE key = 'maintenance'`
   );
 
-  if (setting.rows[0]?.value === 'true') {
+  const exempt = [
+    '/api/health',
+    '/api/login',
+    '/api/register',
+    '/api/auth/login',
+    '/api/auth/register'
+  ];
+
+  if (
+    setting.rows[0]?.value === 'true' &&
+    !exempt.includes(req.path)
+  ) {
     return res.status(503).json({
       error: 'The website is currently under maintenance.'
     });
@@ -297,141 +313,147 @@ app.use(asyncRoute(async (req, res, next) => {
   next();
 }));
 
-app.use(asyncRoute(async (req, res, next) => {
-  const ip = getIp(req);
-  const result = await pool.query(
-    'SELECT id FROM banned_ips WHERE ip = $1',
-    [ip]
-  );
-
-  if (result.rowCount) {
-    return res.status(403).json({ error: 'Access denied.' });
-  }
-
-  next();
-}));
-
-// Health check
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', service: 'Better16 Community Wiki' });
 });
 
-// Register
-app.post('/api/auth/register', asyncRoute(async (req, res) => {
-  const username = cleanText(req.body.username, 40);
-  const password = String(req.body.password || '');
-  const displayName = cleanText(req.body.display_name || username, 60);
+// Register: old frontend route.
+app.post(['/api/register', '/api/auth/register'],
+  asyncRoute(async (req, res) => {
+    const username = cleanText(req.body.username, 40);
+    const password = String(req.body.password || '');
+    const displayName = cleanText(
+      req.body.displayName || req.body.display_name || username, 60
+    );
 
-  if (!/^[a-zA-Z0-9_]{3,40}$/.test(username)) {
-    return res.status(400).json({
-      error: 'Username must be 3-40 characters and use letters, numbers or underscores.'
-    });
-  }
-
-  if (password.length < 8 || password.length > 200) {
-    return res.status(400).json({
-      error: 'Password must be at least 8 characters.'
-    });
-  }
-
-  const existing = await pool.query(
-    'SELECT id FROM users WHERE LOWER(username) = LOWER($1)',
-    [username]
-  );
-
-  if (existing.rowCount) {
-    return res.status(409).json({ error: 'Username already exists.' });
-  }
-
-  const hash = await bcrypt.hash(password, 12);
-
-  const result = await pool.query(
-    `INSERT INTO users (username, password_hash, display_name)
-     VALUES ($1, $2, $3)
-     RETURNING id, username, display_name, avatar, bio, role`,
-    [username, hash, displayName]
-  );
-
-  req.session.userId = result.rows[0].id;
-  res.json({ user: result.rows[0] });
-}));
-
-// Login
-app.post('/api/auth/login', asyncRoute(async (req, res) => {
-  const username = cleanText(req.body.username, 40);
-  const password = String(req.body.password || '');
-
-  const result = await pool.query(
-    `SELECT * FROM users
-     WHERE LOWER(username) = LOWER($1)`,
-    [username]
-  );
-
-  const user = result.rows[0];
-
-  if (!user || !user.password_hash ||
-      !await bcrypt.compare(password, user.password_hash)) {
-    return res.status(401).json({ error: 'Incorrect username or password.' });
-  }
-
-  if (user.is_banned) {
-    return res.status(403).json({ error: 'This account has been banned.' });
-  }
-
-  req.session.regenerate(err => {
-    if (err) {
-      return res.status(500).json({ error: 'Could not start session.' });
+    if (!/^[a-zA-Z0-9_]{3,40}$/.test(username)) {
+      return res.status(400).json({ error: 'Invalid username.' });
     }
 
-    req.session.userId = user.id;
+    if (password.length < 8 || password.length > 200) {
+      return res.status(400).json({
+        error: 'Password must be at least 8 characters.'
+      });
+    }
 
-    res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        display_name: user.display_name,
-        avatar: user.avatar,
-        bio: user.bio,
-        role: user.role
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(username) = LOWER($1)',
+      [username]
+    );
+
+    if (existing.rowCount) {
+      return res.status(409).json({ error: 'Username already exists.' });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
+      `INSERT INTO users (username, password_hash, display_name)
+       VALUES ($1, $2, $3)
+       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
+      [username, hash, displayName]
+    );
+
+    req.session.userId = result.rows[0].id;
+
+    res.json({ user: userForFrontend(result.rows[0]) });
+  })
+);
+
+// Login: old frontend route.
+app.post(['/api/login', '/api/auth/login'],
+  asyncRoute(async (req, res) => {
+    const username = cleanText(req.body.username, 40);
+    const password = String(req.body.password || '');
+
+    const result = await pool.query(
+      'SELECT * FROM users WHERE LOWER(username) = LOWER($1)',
+      [username]
+    );
+
+    const user = result.rows[0];
+
+    if (!user || !user.password_hash ||
+        !await bcrypt.compare(password, user.password_hash)) {
+      return res.status(401).json({
+        error: 'Incorrect username or password.'
+      });
+    }
+
+    if (user.is_banned) {
+      return res.status(403).json({ error: 'Account banned.' });
+    }
+
+    req.session.regenerate(err => {
+      if (err) {
+        return res.status(500).json({ error: 'Session error.' });
       }
-    });
-  });
-}));
 
-// Logout
-app.post('/api/auth/logout', (req, res) => {
+      req.session.userId = user.id;
+      res.json({ user: userForFrontend(user) });
+    });
+  })
+);
+
+// Logout: old frontend route.
+app.post(['/api/logout', '/api/auth/logout'], (req, res) => {
   req.session.destroy(() => {
     res.clearCookie('connect.sid');
     res.json({ success: true });
   });
 });
 
-// Current user
+// Current user.
 app.get('/api/me', requireLogin, (req, res) => {
-  res.json({ user: req.user });
+  res.json({ user: userForFrontend(req.user) });
 });
 
-// Update profile
-app.put('/api/profile', requireLogin, asyncRoute(async (req, res) => {
-  const displayName = cleanText(req.body.display_name, 60);
-  const bio = cleanText(req.body.bio, 300);
+// Profile update: PATCH for old frontend, PUT for compatibility.
+app.patch('/api/profile', requireLogin,
+  asyncRoute(async (req, res) => {
+    const name = cleanText(
+      req.body.displayName || req.body.display_name, 60
+    );
+    const bio = cleanText(req.body.bio, 300);
 
-  if (!displayName) {
-    return res.status(400).json({ error: 'Display name is required.' });
-  }
+    if (!name) {
+      return res.status(400).json({ error: 'Display name is required.' });
+    }
 
-  const result = await pool.query(
-    `UPDATE users
-     SET display_name = $1, bio = $2
-     WHERE id = $3
-     RETURNING id, username, display_name, avatar, bio, role`,
-    [displayName, bio, req.user.id]
-  );
+    const result = await pool.query(
+      `UPDATE users SET display_name = $1, bio = $2
+       WHERE id = $3
+       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
+      [name, bio, req.user.id]
+    );
 
-  res.json({ user: result.rows[0] });
-}));
+    res.json({ user: userForFrontend(result.rows[0]) });
+  })
+);
 
-// Upload avatar
+app.put('/api/profile', requireLogin,
+  asyncRoute(async (req, res) => {
+    const name = cleanText(
+      req.body.displayName || req.body.display_name, 60
+    );
+    const bio = cleanText(req.body.bio, 300);
+
+    if (!name) {
+      return res.status(400).json({ error: 'Display name is required.' });
+    }
+
+    const result = await pool.query(
+      `UPDATE users SET display_name = $1, bio = $2
+       WHERE id = $3
+       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
+      [name, bio, req.user.id]
+    );
+
+    res.json({ user: userForFrontend(result.rows[0]) });
+  })
+);
+
+// Avatar upload.
 app.post('/api/profile/avatar', requireLogin, upload.single('avatar'),
   asyncRoute(async (req, res) => {
     if (!req.file) {
@@ -443,37 +465,56 @@ app.post('/api/profile/avatar', requireLogin, upload.single('avatar'),
     const result = await pool.query(
       `UPDATE users SET avatar = $1
        WHERE id = $2
-       RETURNING id, username, display_name, avatar, bio`,
+       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
       [avatar, req.user.id]
     );
 
-    res.json({ user: result.rows[0] });
+    res.json({ user: userForFrontend(result.rows[0]) });
   })
 );
 
-// List posts
+// Posts: supports old body field and new content field.
 app.get('/api/posts', asyncRoute(async (req, res) => {
-  const result = await pool.query(`
-    SELECT
-      p.id, p.user_id, p.title, p.content, p.tags, p.image,
-      p.is_official, p.created_at,
-      u.username, u.display_name, u.avatar
-    FROM posts p
-    LEFT JOIN users u ON u.id = p.user_id
-    ORDER BY p.is_official DESC, p.created_at DESC
-    LIMIT 100
-  `);
+  const q = cleanText(req.query.q, 100);
+  const tag = cleanText(req.query.tag, 30);
 
-  res.json({ posts: result.rows });
+  const result = await pool.query(
+    `SELECT p.id, p.user_id, p.title, p.content AS body,
+            p.tags, p.image, p.is_official, p.created_at,
+            u.username, u.display_name, u.avatar
+     FROM posts p
+     LEFT JOIN users u ON u.id = p.user_id
+     WHERE ($1 = '' OR p.title ILIKE '%' || $1 || '%'
+       OR p.content ILIKE '%' || $1 || '%'
+       OR u.username ILIKE '%' || $1 || '%'
+       OR u.display_name ILIKE '%' || $1 || '%')
+       AND ($2 = '' OR $2 = ANY(p.tags))
+     ORDER BY p.is_official DESC, p.created_at DESC
+     LIMIT 100`,
+    [q, tag]
+  );
+
+  res.json({
+    posts: result.rows.map(p => ({
+      ...p,
+      display_name: p.display_name || p.username || 'User'
+    }))
+  });
 }));
 
-// Create post
 app.post('/api/posts', requireLogin, asyncRoute(async (req, res) => {
   const title = cleanText(req.body.title, 160);
-  const content = cleanText(req.body.content, 10000);
-  const tags = Array.isArray(req.body.tags)
-    ? req.body.tags.map(t => cleanText(t, 30)).filter(Boolean).slice(0, 10)
-    : [];
+  const content = cleanText(req.body.body || req.body.content, 10000);
+
+  const rawTags = req.body.tags;
+  const tags = Array.isArray(rawTags)
+    ? rawTags
+    : String(rawTags || '').split(',');
+
+  const safeTags = tags
+    .map(t => cleanText(t.replace(/^#/, ''), 30))
+    .filter(Boolean)
+    .slice(0, 10);
 
   if (!content) {
     return res.status(400).json({ error: 'Post content is required.' });
@@ -482,128 +523,20 @@ app.post('/api/posts', requireLogin, asyncRoute(async (req, res) => {
   const result = await pool.query(
     `INSERT INTO posts (user_id, title, content, tags)
      VALUES ($1, $2, $3, $4)
-     RETURNING *`,
-    [req.user.id, title, content, tags]
+     RETURNING id, title, content AS body, tags, created_at`,
+    [req.user.id, title, content, safeTags]
   );
 
   res.json({ post: result.rows[0] });
 }));
 
-// Delete own post
-app.delete('/api/posts/:id', requireLogin, asyncRoute(async (req, res) => {
-  const postId = Number(req.params.id);
-
-  if (!Number.isInteger(postId)) {
-    return res.status(400).json({ error: 'Invalid post ID.' });
-  }
-
-  const result = await pool.query(
-    `DELETE FROM posts
-     WHERE id = $1 AND user_id = $2
-     RETURNING id`,
-    [postId, req.user.id]
-  );
-
-  if (!result.rowCount) {
-    return res.status(404).json({ error: 'Post not found.' });
-  }
-
-  res.json({ success: true });
-}));
-
-// Active announcement
-app.get('/api/announcement', asyncRoute(async (_req, res) => {
-  const result = await pool.query(
-    `SELECT id, title, content, created_at
-     FROM announcements
-     WHERE active = TRUE
-     ORDER BY created_at DESC
-     LIMIT 1`
-  );
-
-  res.json({ announcement: result.rows[0] || null });
-}));
-
-// Admin: dashboard summary
-app.get('/api/admin/stats', requireAdmin, asyncRoute(async (_req, res) => {
-  const [users, posts, banned, announcement] = await Promise.all([
-    pool.query('SELECT COUNT(*)::int AS count FROM users'),
-    pool.query('SELECT COUNT(*)::int AS count FROM posts'),
-    pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_banned = TRUE'),
-    pool.query(`SELECT value FROM site_settings WHERE key = 'maintenance'`)
-  ]);
-
-  res.json({
-    users: users.rows[0].count,
-    posts: posts.rows[0].count,
-    bannedUsers: banned.rows[0].count,
-    maintenance: announcement.rows[0]?.value === 'true'
-  });
-}));
-
-// Admin: create announcement
-app.post('/api/admin/announcement', requireAdmin,
-  asyncRoute(async (req, res) => {
-    const title = cleanText(req.body.title, 160);
-    const content = cleanText(req.body.content, 5000);
-
-    if (!content) {
-      return res.status(400).json({ error: 'Announcement content is required.' });
-    }
-
-    await pool.query('UPDATE announcements SET active = FALSE');
-
-    const result = await pool.query(
-      `INSERT INTO announcements (title, content, active)
-       VALUES ($1, $2, TRUE)
-       RETURNING *`,
-      [title, content]
-    );
-
-    res.json({ announcement: result.rows[0] });
-  })
-);
-
-// Admin: remove announcement
-app.delete('/api/admin/announcement', requireAdmin,
-  asyncRoute(async (_req, res) => {
-    await pool.query('UPDATE announcements SET active = FALSE');
-    res.json({ success: true });
-  })
-);
-
-// Admin: publish official post
-app.post('/api/admin/posts', requireAdmin,
-  asyncRoute(async (req, res) => {
-    const title = cleanText(req.body.title, 160);
-    const content = cleanText(req.body.content, 10000);
-    const tags = Array.isArray(req.body.tags)
-      ? req.body.tags.map(t => cleanText(t, 30)).filter(Boolean).slice(0, 10)
-      : [];
-
-    if (!content) {
-      return res.status(400).json({ error: 'Post content is required.' });
-    }
-
-    const result = await pool.query(
-      `INSERT INTO posts (user_id, title, content, tags, is_official)
-       VALUES ($1, $2, $3, $4, TRUE)
-       RETURNING *`,
-      [req.user.id, title, content, tags]
-    );
-
-    res.json({ post: result.rows[0] });
-  })
-);
-
-// Admin: delete any post
-app.delete('/api/admin/posts/:id', requireAdmin,
+app.delete('/api/posts/:id', requireLogin,
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
 
     const result = await pool.query(
-      'DELETE FROM posts WHERE id = $1 RETURNING id',
-      [id]
+      'DELETE FROM posts WHERE id = $1 AND user_id = $2 RETURNING id',
+      [id, req.user.id]
     );
 
     if (!result.rowCount) {
@@ -614,7 +547,111 @@ app.delete('/api/admin/posts/:id', requireAdmin,
   })
 );
 
-// Admin: ban or unban account
+// People search.
+app.get('/api/users', asyncRoute(async (req, res) => {
+  const q = cleanText(req.query.q, 100);
+
+  const result = await pool.query(
+    `SELECT id, username, display_name, avatar
+     FROM users
+     WHERE username ILIKE '%' || $1 || '%'
+        OR display_name ILIKE '%' || $1 || '%'
+     ORDER BY username LIMIT 30`,
+    [q]
+  );
+
+  res.json({
+    users: result.rows.map(u => ({
+      ...u,
+      displayName: u.display_name
+    }))
+  });
+}));
+
+// Announcement read: supports old frontend.
+app.get(['/api/announcement', '/api/announcements/latest'],
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, title, content AS message, created_at
+       FROM announcements
+       WHERE active = TRUE
+       ORDER BY created_at DESC LIMIT 1`
+    );
+
+    res.json({ announcement: result.rows[0] || null });
+  })
+);
+
+// Admin announcement publish.
+app.post(['/api/announcements', '/api/admin/announcement'],
+  requireAdmin,
+  asyncRoute(async (req, res) => {
+    const message = cleanText(req.body.message || req.body.content, 5000);
+
+    if (!message) {
+      return res.status(400).json({ error: 'Announcement is empty.' });
+    }
+
+    await pool.query('UPDATE announcements SET active = FALSE');
+
+    const result = await pool.query(
+      `INSERT INTO announcements (title, content, active)
+       VALUES ($1, $2, TRUE)
+       RETURNING id, title, content AS message, created_at`,
+      [
+        cleanText(req.body.title || 'Community Announcement', 160),
+        message
+      ]
+    );
+
+    res.json({ announcement: result.rows[0] });
+  })
+);
+
+app.delete('/api/admin/announcement', requireAdmin,
+  asyncRoute(async (_req, res) => {
+    await pool.query('UPDATE announcements SET active = FALSE');
+    res.json({ success: true });
+  })
+);
+
+// Admin official post.
+app.post('/api/admin/posts', requireAdmin,
+  asyncRoute(async (req, res) => {
+    const title = cleanText(req.body.title, 160);
+    const content = cleanText(req.body.body || req.body.content, 10000);
+
+    if (!content) {
+      return res.status(400).json({ error: 'Post content is required.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO posts (user_id, title, content, tags, is_official)
+       VALUES ($1, $2, $3, $4, TRUE) RETURNING *`,
+      [req.user.id, title, content, [],]
+    );
+
+    res.json({ post: result.rows[0] });
+  })
+);
+
+// Admin delete any post.
+app.delete('/api/admin/posts/:id', requireAdmin,
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(
+      'DELETE FROM posts WHERE id = $1 RETURNING id',
+      [Number(req.params.id)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'Post not found.' });
+    }
+
+    res.json({ success: true });
+  })
+);
+
+// Admin ban/unban user.
 app.post('/api/admin/users/:id/ban', requireAdmin,
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
@@ -640,7 +677,36 @@ app.post('/api/admin/users/:id/ban', requireAdmin,
   })
 );
 
-// Admin: ban IP
+// Admin user list.
+app.get('/api/admin/users', requireAdmin,
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT id, username, display_name, role, is_banned, created_at
+       FROM users ORDER BY created_at DESC LIMIT 200`
+    );
+
+    res.json({ users: result.rows });
+  })
+);
+
+// Admin promote/demote.
+app.post('/api/admin/users/:id/admin', requireAdmin,
+  asyncRoute(async (req, res) => {
+    const result = await pool.query(
+      `UPDATE users SET role = $1
+       WHERE id = $2 RETURNING id, username, role`,
+      [req.body.admin === true ? 'admin' : 'user', Number(req.params.id)]
+    );
+
+    if (!result.rowCount) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    res.json({ user: result.rows[0] });
+  })
+);
+
+// Admin IP ban.
 app.post('/api/admin/ip-ban', requireAdmin,
   asyncRoute(async (req, res) => {
     const ip = cleanText(req.body.ip, 100);
@@ -661,19 +727,17 @@ app.post('/api/admin/ip-ban', requireAdmin,
   })
 );
 
-// Admin: remove IP ban
 app.delete('/api/admin/ip-ban/:ip', requireAdmin,
   asyncRoute(async (req, res) => {
     await pool.query(
       'DELETE FROM banned_ips WHERE ip = $1',
       [cleanText(req.params.ip, 100)]
     );
-
     res.json({ success: true });
   })
 );
 
-// Admin: maintenance mode
+// Admin maintenance mode.
 app.post('/api/admin/maintenance', requireAdmin,
   asyncRoute(async (req, res) => {
     const enabled = req.body.enabled === true;
@@ -681,8 +745,7 @@ app.post('/api/admin/maintenance', requireAdmin,
     await pool.query(
       `INSERT INTO site_settings (key, value)
        VALUES ('maintenance', $1)
-       ON CONFLICT (key)
-       DO UPDATE SET value = EXCLUDED.value`,
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
       [enabled ? 'true' : 'false']
     );
 
@@ -690,56 +753,41 @@ app.post('/api/admin/maintenance', requireAdmin,
   })
 );
 
-// Admin: list users
-app.get('/api/admin/users', requireAdmin,
+// Admin stats.
+app.get('/api/admin/stats', requireAdmin,
   asyncRoute(async (_req, res) => {
-    const result = await pool.query(`
-      SELECT id, username, display_name, role, is_banned, created_at
-      FROM users
-      ORDER BY created_at DESC
-      LIMIT 200
-    `);
+    const [users, posts, banned, maintenance] = await Promise.all([
+      pool.query('SELECT COUNT(*)::int AS count FROM users'),
+      pool.query('SELECT COUNT(*)::int AS count FROM posts'),
+      pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_banned = TRUE'),
+      pool.query(`SELECT value FROM site_settings WHERE key = 'maintenance'`)
+    ]);
 
-    res.json({ users: result.rows });
+    res.json({
+      users: users.rows[0].count,
+      posts: posts.rows[0].count,
+      bannedUsers: banned.rows[0].count,
+      maintenance: maintenance.rows[0]?.value === 'true'
+    });
   })
 );
 
-// Admin: promote a user to admin
-app.post('/api/admin/users/:id/admin', requireAdmin,
-  asyncRoute(async (req, res) => {
-    const id = Number(req.params.id);
-
-    const result = await pool.query(
-      `UPDATE users SET role = $1
-       WHERE id = $2
-       RETURNING id, username, role`,
-      [req.body.admin === true ? 'admin' : 'user', id]
-    );
-
-    if (!result.rowCount) {
-      return res.status(404).json({ error: 'User not found.' });
-    }
-
-    res.json({ user: result.rows[0] });
-  })
-);
-
-// Unknown API route
+// Unknown API endpoint.
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'API endpoint not found.' });
 });
 
-// Frontend fallback
+// Frontend.
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Error handler
+// Error handler.
 app.use((err, _req, res, _next) => {
   console.error(err);
 
   if (err instanceof multer.MulterError) {
-    return res.status(400).json({ error: 'Image upload failed: ' + err.message });
+    return res.status(400).json({ error: err.message });
   }
 
   res.status(500).json({
