@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#3b5998">
+  <title>Better16 Community Wiki</title>
+  <link rel="icon" type="image/png" href="/icon.png">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="mobile-menu" id="menuBtn" aria-label="Open menu">☰</button>
+    <a class="brand" href="/"><img src="/icon.png" alt="Better16 icon"><span>Better16 <b>Community Wiki</b></span></a>
+    <div class="top-actions"><span id="topUser" class="top-user"></span><button class="btn small" id="authButton">Sign In</button></div>
+  </header>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="side-search"><label for="searchInput">Search the wiki</label><input id="searchInput" placeholder="Posts, tags, users..."><button id="searchBtn">Search</button></div>
+      <nav>
+        <a class="nav-link active" href="/" id="homeLink"><span>⌂</span> Home</a>
+        <a class="nav-link" href="#posts"><span>▤</span> All Posts</a>
+        <a class="nav-link" href="#tags"><span>◇</span> Browse Tags</a>
+        <div class="nav-separator"></div>
+        <a class="nav-link external" href="https://better16.wtf/download" target="_blank" rel="noopener"><span>⇩</span> Download</a>
+        <a class="nav-link external" href="https://better16.wtf/" target="_blank" rel="noopener"><span>↗</span> Official Website</a>
+      </nav>
+      <div class="sidebar-note"><b>BETTER16 WIKI</b><p>A community space made by players, for players.</p></div>
+      <div class="sidebar-footer">Community project · Not an official wiki</div>
+    </aside>
+
+    <main class="content">
+      <div id="announcement" class="announcement hidden"><span class="announce-icon">!</span><div><b>ANNOUNCEMENT</b><p id="announcementText"></p></div><button id="closeAnnouncement" aria-label="Dismiss announcement">×</button></div>
+      <section class="hero">
+        <div><div class="eyebrow">THE COMMUNITY KNOWLEDGE BASE</div><h1>Welcome to Better16 Wiki</h1><p>Share discoveries, guides, updates and useful information with the community.</p></div>
+        <img src="/icon.png" alt="Better16 official icon" class="hero-icon">
+      </section>
+      <div class="toolbar"><div><h2 id="feedHeading">Latest Community Posts</h2><p class="muted" id="feedSub">Discover what the community is talking about.</p></div><button class="btn primary" id="newPostBtn">＋ Create a Post</button></div>
+      <section id="postComposer" class="panel hidden">
+        <h3>Create a community post</h3>
+        <form id="postForm"><label>Post title<input name="title" maxlength="120" required placeholder="Give your post a title"></label><label>Content<textarea name="body" rows="5" maxlength="8000" required placeholder="Share something useful with the community..."></textarea></label><label>Tags <span class="muted">(comma separated, up to 5)</span><input name="tags" placeholder="guide, news, help"></label><div class="form-actions"><button type="button" class="btn" id="cancelPost">Cancel</button><button class="btn primary">Publish Post</button></div></form>
+      </section>
+      <section id="tagBrowser" class="tag-browser hidden"><h3>Popular tags</h3><div id="tagList" class="tag-list"></div></section>
+      <section id="posts" class="posts"><div class="loading">Loading community posts...</div></section>
+      <section id="peopleResults" class="people hidden"></section>
+      <footer class="page-footer">Better16 Community Wiki · Built for the community <span>2020-inspired interface</span></footer>
+    </main>
+  </div>
+
+  <div class="modal hidden" id="authModal"><div class="modal-card"><button class="modal-close" data-close="authModal">×</button><div class="modal-logo"><img src="/icon.png" alt=""></div><h2 id="authTitle">Welcome back</h2><p class="muted" id="authSubtitle">Sign in to join the community.</p><form id="authForm"><label>Username<input name="username" minlength="3" maxlength="24" required autocomplete="username"></label><label id="displayNameField" class="hidden">Display name<input name="displayName" maxlength="32" placeholder="How should we call you?"></label><label>Password<input name="password" type="password" minlength="8" required autocomplete="current-password"></label><button class="btn primary full">Continue</button></form><p class="switch-auth" id="switchAuth">New here? <a href="#">Create an account</a></p><p class="error" id="authError"></p></div></div>
+
+  <div class="modal hidden" id="profileModal"><div class="modal-card"><button class="modal-close" data-close="profileModal">×</button><h2>Your Profile</h2><div class="profile-preview"><img id="profileAvatar" src="/icon.png" alt="Avatar"><div><b id="profileUsername"></b><p class="muted">Community member</p></div></div><form id="profileForm"><label>Display name<input name="displayName" maxlength="32" required></label><label>Upload avatar <span class="muted">(PNG, JPG, WEBP or GIF · max 2 MB)</span><input name="avatar" type="file" accept="image/png,image/jpeg,image/webp,image/gif"></label><button class="btn primary full">Save Profile</button></form><button class="btn full logout" id="logoutBtn">Sign Out</button><p class="error" id="profileError"></p></div></div>
+
+  <div class="modal hidden" id="adminModal"><div class="modal-card"><button class="modal-close" data-close="adminModal">×</button><h2>Admin Announcement</h2><p class="muted">Publish a message in the yellow announcement bar for all visitors.</p><form id="announcementForm"><label>Announcement<textarea name="message" rows="4" maxlength="500" required placeholder="Write an announcement..."></textarea></label><button class="btn primary full">Publish Announcement</button></form><p class="error" id="adminError"></p></div></div>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body></html>
