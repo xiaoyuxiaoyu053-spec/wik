@@ -16,22 +16,24 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3000;
 const DATABASE_URL = process.env.DATABASE_URL;
+const isProduction = process.env.NODE_ENV === 'production';
 
-if (process.env.NODE_ENV === 'production' && !DATABASE_URL) {
+// 独立的新 Session 表，避免旧表索引冲突
+const SESSION_TABLE = 'better16_sessions';
+
+if (isProduction && !DATABASE_URL) {
   console.error('DATABASE_URL is missing.');
   process.exit(1);
 }
 
-if (process.env.NODE_ENV === 'production' && !process.env.SESSION_SECRET) {
+if (isProduction && !process.env.SESSION_SECRET) {
   console.error('SESSION_SECRET is missing.');
   process.exit(1);
 }
 
 const pool = new Pool({
   connectionString: DATABASE_URL || 'postgresql://localhost:5432/better16',
-  ssl: process.env.NODE_ENV === 'production'
-    ? { rejectUnauthorized: false }
-    : false,
+  ssl: isProduction ? { rejectUnauthorized: false } : false,
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   max: 10
@@ -43,18 +45,19 @@ fs.mkdirSync(uploadDir, { recursive: true });
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
+// Session 表由 initDb() 创建
 app.use(session({
   store: new PgSession({
     pool,
-    tableName: 'session',
-    createTableIfMissing: true
+    tableName: SESSION_TABLE,
+    createTableIfMissing: false
   }),
   secret: process.env.SESSION_SECRET || 'development-only-secret',
   resave: false,
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: isProduction,
     sameSite: 'lax',
     maxAge: 30 * 24 * 60 * 60 * 1000
   }
@@ -89,22 +92,27 @@ function cleanText(value, max = 500) {
 function getIp(req) {
   const forwarded = req.headers['x-forwarded-for'];
   return String(
-    forwarded ? forwarded.split(',')[0].trim() : req.socket.remoteAddress || ''
+    forwarded
+      ? forwarded.split(',')[0].trim()
+      : req.socket.remoteAddress || ''
   ).slice(0, 100);
 }
 
 function asyncRoute(fn) {
-  return (req, res, next) =>
+  return (req, res, next) => {
     Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
 async function hasColumn(table, column) {
   const result = await pool.query(
     `SELECT 1 FROM information_schema.columns
      WHERE table_schema = current_schema()
-       AND table_name = $1 AND column_name = $2`,
+       AND table_name = $1
+       AND column_name = $2`,
     [table, column]
   );
+
   return result.rowCount > 0;
 }
 
@@ -116,6 +124,24 @@ async function addColumn(table, column, definition) {
     console.log(`Added database column: ${table}.${column}`);
   }
 }
+
+function userForFrontend(user) {
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.display_name,
+    display_name: user.display_name,
+    avatar: user.avatar,
+    bio: user.bio,
+    role: user.role,
+    isAdmin: user.role === 'admin',
+    is_banned: user.is_banned
+  };
+}
+
+// =========================
+// Database initialization
+// =========================
 
 async function initDb() {
   console.log('Initializing database...');
@@ -134,24 +160,42 @@ async function initDb() {
     )
   `);
 
-  await addColumn('users', 'username', 'VARCHAR(40)');
-  await addColumn('users', 'password_hash', 'TEXT');
-  await addColumn('users', 'display_name', 'VARCHAR(60)');
-  await addColumn('users', 'avatar', 'TEXT');
-  await addColumn('users', 'bio', 'TEXT');
-  await addColumn('users', 'role', "VARCHAR(20) DEFAULT 'user'");
-  await addColumn('users', 'is_banned', 'BOOLEAN DEFAULT FALSE');
-  await addColumn('users', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()');
+  const userColumns = [
+    ['username', 'VARCHAR(40)'],
+    ['password_hash', 'TEXT'],
+    ['display_name', 'VARCHAR(60)'],
+    ['avatar', 'TEXT'],
+    ['bio', 'TEXT'],
+    ['role', "VARCHAR(20) DEFAULT 'user'"],
+    ['is_banned', 'BOOLEAN DEFAULT FALSE'],
+    ['created_at', 'TIMESTAMPTZ DEFAULT NOW()']
+  ];
+
+  for (const [column, definition] of userColumns) {
+    await addColumn('users', column, definition);
+  }
 
   await pool.query(`
-    UPDATE users SET display_name = username
+    UPDATE users
+    SET display_name = username
     WHERE display_name IS NULL OR display_name = ''
   `);
+
   await pool.query(`
-    UPDATE users SET role = 'user' WHERE role IS NULL OR role = ''
+    UPDATE users SET role = 'user'
+    WHERE role IS NULL OR role = ''
   `);
+
   await pool.query(`
-    UPDATE users SET is_banned = FALSE WHERE is_banned IS NULL
+    UPDATE users SET is_banned = FALSE
+    WHERE is_banned IS NULL
+  `);
+
+  // 兼容旧用户表
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx
+    ON users (LOWER(username))
+    WHERE username IS NOT NULL
   `);
 
   await pool.query(`
@@ -167,13 +211,28 @@ async function initDb() {
     )
   `);
 
-  await addColumn('posts', 'user_id', 'INTEGER');
-  await addColumn('posts', 'title', 'VARCHAR(160)');
-  await addColumn('posts', 'content', 'TEXT');
-  await addColumn('posts', 'tags', "TEXT[] DEFAULT '{}'");
-  await addColumn('posts', 'image', 'TEXT');
-  await addColumn('posts', 'is_official', 'BOOLEAN DEFAULT FALSE');
-  await addColumn('posts', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()');
+  const postColumns = [
+    ['user_id', 'INTEGER'],
+    ['title', 'VARCHAR(160)'],
+    ['content', 'TEXT'],
+    ['tags', "TEXT[] DEFAULT '{}'"],
+    ['image', 'TEXT'],
+    ['is_official', 'BOOLEAN DEFAULT FALSE'],
+    ['created_at', 'TIMESTAMPTZ DEFAULT NOW()']
+  ];
+
+  for (const [column, definition] of postColumns) {
+    await addColumn('posts', column, definition);
+  }
+
+  // 如果旧版本使用 body 字段，迁移内容
+  if (await hasColumn('posts', 'body')) {
+    await pool.query(`
+      UPDATE posts SET content = body
+      WHERE (content IS NULL OR content = '')
+      AND body IS NOT NULL
+    `);
+  }
 
   await pool.query(`UPDATE posts SET tags = '{}' WHERE tags IS NULL`);
   await pool.query(`UPDATE posts SET content = '' WHERE content IS NULL`);
@@ -188,10 +247,24 @@ async function initDb() {
     )
   `);
 
-  await addColumn('announcements', 'title', 'VARCHAR(160)');
-  await addColumn('announcements', 'content', 'TEXT');
-  await addColumn('announcements', 'active', 'BOOLEAN DEFAULT TRUE');
-  await addColumn('announcements', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()');
+  const announcementColumns = [
+    ['title', 'VARCHAR(160)'],
+    ['content', 'TEXT'],
+    ['active', 'BOOLEAN DEFAULT TRUE'],
+    ['created_at', 'TIMESTAMPTZ DEFAULT NOW()']
+  ];
+
+  for (const [column, definition] of announcementColumns) {
+    await addColumn('announcements', column, definition);
+  }
+
+  if (await hasColumn('announcements', 'message')) {
+    await pool.query(`
+      UPDATE announcements SET content = message
+      WHERE (content IS NULL OR content = '')
+      AND message IS NOT NULL
+    `);
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS banned_ips (
@@ -220,27 +293,33 @@ async function initDb() {
     ON posts(created_at DESC)
   `);
 
+  // 新 Session 表：不修改、不删除原来的 session 表
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "${SESSION_TABLE}" (
+      "sid" VARCHAR NOT NULL PRIMARY KEY,
+      "sess" JSON NOT NULL,
+      "expire" TIMESTAMP(6) NOT NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS better16_sessions_expire_idx
+    ON "${SESSION_TABLE}" ("expire")
+  `);
+
   console.log('Database initialization completed.');
 }
 
-function userForFrontend(user) {
-  return {
-    id: user.id,
-    username: user.username,
-    displayName: user.display_name,
-    display_name: user.display_name,
-    avatar: user.avatar,
-    bio: user.bio,
-    role: user.role,
-    isAdmin: user.role === 'admin',
-    is_banned: user.is_banned
-  };
-}
+// =========================
+// Authentication middleware
+// =========================
 
 async function requireLogin(req, res, next) {
   try {
     if (!req.session.userId) {
-      return res.status(401).json({ error: 'Please sign in first.' });
+      return res.status(401).json({
+        error: 'Please sign in first.'
+      });
     }
 
     const result = await pool.query(
@@ -254,32 +333,41 @@ async function requireLogin(req, res, next) {
 
     if (!user || user.is_banned) {
       req.session.destroy(() => {});
-      return res.status(403).json({ error: 'Account unavailable.' });
+      return res.status(403).json({
+        error: 'Account unavailable.'
+      });
     }
 
     req.user = user;
-    next();
+    return next();
   } catch (err) {
-    next(err);
+    return next(err);
   }
 }
 
 function requireAdmin(req, res, next) {
-  requireLogin(req, res, () => {
+  return requireLogin(req, res, () => {
     if (req.user.role !== 'admin') {
-      return res.status(403).json({ error: 'Administrator access required.' });
+      return res.status(403).json({
+        error: 'Administrator access required.'
+      });
     }
-    next();
+
+    return next();
   });
 }
 
-// Check IP bans and maintenance mode.
+// =========================
+// IP bans and maintenance
+// =========================
+
 app.use(asyncRoute(async (req, res, next) => {
   if (!req.path.startsWith('/api/') || req.path === '/api/health') {
     return next();
   }
 
   const ip = getIp(req);
+
   const banned = await pool.query(
     'SELECT id FROM banned_ips WHERE ip = $1',
     [ip]
@@ -310,20 +398,31 @@ app.use(asyncRoute(async (req, res, next) => {
     });
   }
 
-  next();
+  return next();
 }));
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'Better16 Community Wiki' });
+  res.json({
+    status: 'ok',
+    service: 'Better16 Community Wiki'
+  });
 });
 
-// Register: old frontend route.
-app.post(['/api/register', '/api/auth/register'],
+// =========================
+// Register
+// =========================
+
+app.post(
+  ['/api/register', '/api/auth/register'],
   asyncRoute(async (req, res) => {
     const username = cleanText(req.body.username, 40);
     const password = String(req.body.password || '');
+
     const displayName = cleanText(
-      req.body.displayName || req.body.display_name || username, 60
+      req.body.displayName ||
+      req.body.display_name ||
+      username,
+      60
     );
 
     if (!/^[a-zA-Z0-9_]{3,40}$/.test(username)) {
@@ -342,7 +441,9 @@ app.post(['/api/register', '/api/auth/register'],
     );
 
     if (existing.rowCount) {
-      return res.status(409).json({ error: 'Username already exists.' });
+      return res.status(409).json({
+        error: 'Username already exists.'
+      });
     }
 
     const hash = await bcrypt.hash(password, 12);
@@ -356,12 +457,21 @@ app.post(['/api/register', '/api/auth/register'],
 
     req.session.userId = result.rows[0].id;
 
-    res.json({ user: userForFrontend(result.rows[0]) });
+    return req.session.save(err => {
+      if (err) return res.status(500).json({ error: 'Session error.' });
+      return res.json({
+        user: userForFrontend(result.rows[0])
+      });
+    });
   })
 );
 
-// Login: old frontend route.
-app.post(['/api/login', '/api/auth/login'],
+// =========================
+// Login
+// =========================
+
+app.post(
+  ['/api/login', '/api/auth/login'],
   asyncRoute(async (req, res) => {
     const username = cleanText(req.body.username, 40);
     const password = String(req.body.password || '');
@@ -373,8 +483,11 @@ app.post(['/api/login', '/api/auth/login'],
 
     const user = result.rows[0];
 
-    if (!user || !user.password_hash ||
-        !await bcrypt.compare(password, user.password_hash)) {
+    if (
+      !user ||
+      !user.password_hash ||
+      !await bcrypt.compare(password, user.password_hash)
+    ) {
       return res.status(401).json({
         error: 'Incorrect username or password.'
       });
@@ -390,74 +503,87 @@ app.post(['/api/login', '/api/auth/login'],
       }
 
       req.session.userId = user.id;
-      res.json({ user: userForFrontend(user) });
+
+      return req.session.save(saveErr => {
+        if (saveErr) {
+          return res.status(500).json({
+            error: 'Could not save session.'
+          });
+        }
+
+        return res.json({
+          user: userForFrontend(user)
+        });
+      });
     });
   })
 );
 
-// Logout: old frontend route.
-app.post(['/api/logout', '/api/auth/logout'], (req, res) => {
-  req.session.destroy(() => {
-    res.clearCookie('connect.sid');
-    res.json({ success: true });
-  });
-});
+// =========================
+// Logout
+// =========================
 
-// Current user.
+app.post(
+  ['/api/logout', '/api/auth/logout'],
+  (req, res, next) => {
+    req.session.destroy(err => {
+      if (err) return next(err);
+
+      res.clearCookie('connect.sid');
+      return res.json({ success: true });
+    });
+  }
+);
+
+// Current user
 app.get('/api/me', requireLogin, (req, res) => {
   res.json({ user: userForFrontend(req.user) });
 });
 
-// Profile update: PATCH for old frontend, PUT for compatibility.
-app.patch('/api/profile', requireLogin,
-  asyncRoute(async (req, res) => {
-    const name = cleanText(
-      req.body.displayName || req.body.display_name, 60
-    );
-    const bio = cleanText(req.body.bio, 300);
+// =========================
+// Profile
+// =========================
 
-    if (!name) {
-      return res.status(400).json({ error: 'Display name is required.' });
-    }
+async function updateProfile(req, res) {
+  const name = cleanText(
+    req.body.displayName || req.body.display_name,
+    60
+  );
 
-    const result = await pool.query(
-      `UPDATE users SET display_name = $1, bio = $2
-       WHERE id = $3
-       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
-      [name, bio, req.user.id]
-    );
+  const bio = cleanText(req.body.bio, 300);
 
-    res.json({ user: userForFrontend(result.rows[0]) });
-  })
-);
+  if (!name) {
+    return res.status(400).json({
+      error: 'Display name is required.'
+    });
+  }
 
-app.put('/api/profile', requireLogin,
-  asyncRoute(async (req, res) => {
-    const name = cleanText(
-      req.body.displayName || req.body.display_name, 60
-    );
-    const bio = cleanText(req.body.bio, 300);
+  const result = await pool.query(
+    `UPDATE users
+     SET display_name = $1, bio = $2
+     WHERE id = $3
+     RETURNING id, username, display_name, avatar, bio, role, is_banned`,
+    [name, bio, req.user.id]
+  );
 
-    if (!name) {
-      return res.status(400).json({ error: 'Display name is required.' });
-    }
+  return res.json({
+    user: userForFrontend(result.rows[0])
+  });
+}
 
-    const result = await pool.query(
-      `UPDATE users SET display_name = $1, bio = $2
-       WHERE id = $3
-       RETURNING id, username, display_name, avatar, bio, role, is_banned`,
-      [name, bio, req.user.id]
-    );
+app.patch('/api/profile', requireLogin, asyncRoute(updateProfile));
+app.put('/api/profile', requireLogin, asyncRoute(updateProfile));
 
-    res.json({ user: userForFrontend(result.rows[0]) });
-  })
-);
-
-// Avatar upload.
-app.post('/api/profile/avatar', requireLogin, upload.single('avatar'),
+// Avatar upload
+app.post(
+  '/api/profile/avatar',
+  requireLogin,
+  upload.single('avatar'),
   asyncRoute(async (req, res) => {
     if (!req.file) {
-      return res.status(400).json({ error: 'Please select an image.' });
+      return res.status(400).json({
+        error: 'Please select an image.'
+      });
     }
 
     const avatar = '/uploads/' + req.file.filename;
@@ -469,11 +595,16 @@ app.post('/api/profile/avatar', requireLogin, upload.single('avatar'),
       [avatar, req.user.id]
     );
 
-    res.json({ user: userForFrontend(result.rows[0]) });
+    return res.json({
+      user: userForFrontend(result.rows[0])
+    });
   })
 );
 
-// Posts: supports old body field and new content field.
+// =========================
+// Posts
+// =========================
+
 app.get('/api/posts', asyncRoute(async (req, res) => {
   const q = cleanText(req.query.q, 100);
   const tag = cleanText(req.query.tag, 30);
@@ -494,7 +625,7 @@ app.get('/api/posts', asyncRoute(async (req, res) => {
     [q, tag]
   );
 
-  res.json({
+  return res.json({
     posts: result.rows.map(p => ({
       ...p,
       display_name: p.display_name || p.username || 'User'
@@ -504,7 +635,10 @@ app.get('/api/posts', asyncRoute(async (req, res) => {
 
 app.post('/api/posts', requireLogin, asyncRoute(async (req, res) => {
   const title = cleanText(req.body.title, 160);
-  const content = cleanText(req.body.body || req.body.content, 10000);
+  const content = cleanText(
+    req.body.body || req.body.content,
+    10000
+  );
 
   const rawTags = req.body.tags;
   const tags = Array.isArray(rawTags)
@@ -512,12 +646,14 @@ app.post('/api/posts', requireLogin, asyncRoute(async (req, res) => {
     : String(rawTags || '').split(',');
 
   const safeTags = tags
-    .map(t => cleanText(t.replace(/^#/, ''), 30))
+    .map(t => cleanText(String(t).replace(/^#/, ''), 30))
     .filter(Boolean)
     .slice(0, 10);
 
   if (!content) {
-    return res.status(400).json({ error: 'Post content is required.' });
+    return res.status(400).json({
+      error: 'Post content is required.'
+    });
   }
 
   const result = await pool.query(
@@ -527,27 +663,30 @@ app.post('/api/posts', requireLogin, asyncRoute(async (req, res) => {
     [req.user.id, title, content, safeTags]
   );
 
-  res.json({ post: result.rows[0] });
+  return res.json({ post: result.rows[0] });
 }));
 
-app.delete('/api/posts/:id', requireLogin,
+app.delete(
+  '/api/posts/:id',
+  requireLogin,
   asyncRoute(async (req, res) => {
-    const id = Number(req.params.id);
-
     const result = await pool.query(
       'DELETE FROM posts WHERE id = $1 AND user_id = $2 RETURNING id',
-      [id, req.user.id]
+      [Number(req.params.id), req.user.id]
     );
 
     if (!result.rowCount) {
       return res.status(404).json({ error: 'Post not found.' });
     }
 
-    res.json({ success: true });
+    return res.json({ success: true });
   })
 );
 
-// People search.
+// =========================
+// User search
+// =========================
+
 app.get('/api/users', asyncRoute(async (req, res) => {
   const q = cleanText(req.query.q, 100);
 
@@ -556,11 +695,12 @@ app.get('/api/users', asyncRoute(async (req, res) => {
      FROM users
      WHERE username ILIKE '%' || $1 || '%'
         OR display_name ILIKE '%' || $1 || '%'
-     ORDER BY username LIMIT 30`,
+     ORDER BY username
+     LIMIT 30`,
     [q]
   );
 
-  res.json({
+  return res.json({
     users: result.rows.map(u => ({
       ...u,
       displayName: u.display_name
@@ -568,28 +708,40 @@ app.get('/api/users', asyncRoute(async (req, res) => {
   });
 }));
 
-// Announcement read: supports old frontend.
-app.get(['/api/announcement', '/api/announcements/latest'],
+// =========================
+// Announcements
+// =========================
+
+app.get(
+  ['/api/announcement', '/api/announcements/latest'],
   asyncRoute(async (_req, res) => {
     const result = await pool.query(
       `SELECT id, title, content AS message, created_at
        FROM announcements
        WHERE active = TRUE
-       ORDER BY created_at DESC LIMIT 1`
+       ORDER BY created_at DESC
+       LIMIT 1`
     );
 
-    res.json({ announcement: result.rows[0] || null });
+    return res.json({
+      announcement: result.rows[0] || null
+    });
   })
 );
 
-// Admin announcement publish.
-app.post(['/api/announcements', '/api/admin/announcement'],
+app.post(
+  ['/api/announcements', '/api/admin/announcement'],
   requireAdmin,
   asyncRoute(async (req, res) => {
-    const message = cleanText(req.body.message || req.body.content, 5000);
+    const message = cleanText(
+      req.body.message || req.body.content,
+      5000
+    );
 
     if (!message) {
-      return res.status(400).json({ error: 'Announcement is empty.' });
+      return res.status(400).json({
+        error: 'Announcement is empty.'
+      });
     }
 
     await pool.query('UPDATE announcements SET active = FALSE');
@@ -604,39 +756,51 @@ app.post(['/api/announcements', '/api/admin/announcement'],
       ]
     );
 
-    res.json({ announcement: result.rows[0] });
+    return res.json({
+      announcement: result.rows[0]
+    });
   })
 );
 
-app.delete('/api/admin/announcement', requireAdmin,
+app.delete(
+  '/api/admin/announcement',
+  requireAdmin,
   asyncRoute(async (_req, res) => {
     await pool.query('UPDATE announcements SET active = FALSE');
-    res.json({ success: true });
+    return res.json({ success: true });
   })
 );
 
-// Admin official post.
-app.post('/api/admin/posts', requireAdmin,
-  asyncRoute(async (req, res) => {
-    const title = cleanText(req.body.title, 160);
-    const content = cleanText(req.body.body || req.body.content, 10000);
+// =========================
+// Admin posts
+// =========================
 
-    if (!content) {
-      return res.status(400).json({ error: 'Post content is required.' });
-    }
+app.post('/api/admin/posts', requireAdmin, asyncRoute(async (req, res) => {
+  const title = cleanText(req.body.title, 160);
+  const content = cleanText(
+    req.body.body || req.body.content,
+    10000
+  );
 
-    const result = await pool.query(
-      `INSERT INTO posts (user_id, title, content, tags, is_official)
-       VALUES ($1, $2, $3, $4, TRUE) RETURNING *`,
-      [req.user.id, title, content, [],]
-    );
+  if (!content) {
+    return res.status(400).json({
+      error: 'Post content is required.'
+    });
+  }
 
-    res.json({ post: result.rows[0] });
-  })
-);
+  const result = await pool.query(
+    `INSERT INTO posts (user_id, title, content, tags, is_official)
+     VALUES ($1, $2, $3, $4, TRUE)
+     RETURNING *`,
+    [req.user.id, title, content, []]
+  );
 
-// Admin delete any post.
-app.delete('/api/admin/posts/:id', requireAdmin,
+  return res.json({ post: result.rows[0] });
+}));
+
+app.delete(
+  '/api/admin/posts/:id',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const result = await pool.query(
       'DELETE FROM posts WHERE id = $1 RETURNING id',
@@ -647,17 +811,24 @@ app.delete('/api/admin/posts/:id', requireAdmin,
       return res.status(404).json({ error: 'Post not found.' });
     }
 
-    res.json({ success: true });
+    return res.json({ success: true });
   })
 );
 
-// Admin ban/unban user.
-app.post('/api/admin/users/:id/ban', requireAdmin,
+// =========================
+// Admin user management
+// =========================
+
+app.post(
+  '/api/admin/users/:id/ban',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const id = Number(req.params.id);
 
     if (id === req.user.id) {
-      return res.status(400).json({ error: 'You cannot ban yourself.' });
+      return res.status(400).json({
+        error: 'You cannot ban yourself.'
+      });
     }
 
     const banned = req.body.banned !== false;
@@ -670,132 +841,178 @@ app.post('/api/admin/users/:id/ban', requireAdmin,
     );
 
     if (!result.rowCount) {
-      return res.status(404).json({ error: 'User not found.' });
+      return res.status(404).json({
+        error: 'User not found.'
+      });
     }
 
-    res.json({ user: result.rows[0] });
+    return res.json({ user: result.rows[0] });
   })
 );
 
-// Admin user list.
-app.get('/api/admin/users', requireAdmin,
-  asyncRoute(async (_req, res) => {
-    const result = await pool.query(
-      `SELECT id, username, display_name, role, is_banned, created_at
-       FROM users ORDER BY created_at DESC LIMIT 200`
-    );
+app.get('/api/admin/users', requireAdmin, asyncRoute(async (_req, res) => {
+  const result = await pool.query(
+    `SELECT id, username, display_name, role, is_banned, created_at
+     FROM users
+     ORDER BY created_at DESC
+     LIMIT 200`
+  );
 
-    res.json({ users: result.rows });
-  })
-);
+  return res.json({ users: result.rows });
+}));
 
-// Admin promote/demote.
-app.post('/api/admin/users/:id/admin', requireAdmin,
+app.post(
+  '/api/admin/users/:id/admin',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const result = await pool.query(
       `UPDATE users SET role = $1
-       WHERE id = $2 RETURNING id, username, role`,
-      [req.body.admin === true ? 'admin' : 'user', Number(req.params.id)]
+       WHERE id = $2
+       RETURNING id, username, role`,
+      [
+        req.body.admin === true ? 'admin' : 'user',
+        Number(req.params.id)
+      ]
     );
 
     if (!result.rowCount) {
-      return res.status(404).json({ error: 'User not found.' });
+      return res.status(404).json({
+        error: 'User not found.'
+      });
     }
 
-    res.json({ user: result.rows[0] });
+    return res.json({ user: result.rows[0] });
   })
 );
 
-// Admin IP ban.
-app.post('/api/admin/ip-ban', requireAdmin,
-  asyncRoute(async (req, res) => {
-    const ip = cleanText(req.body.ip, 100);
-    const reason = cleanText(req.body.reason, 500);
+// =========================
+// Admin IP ban
+// =========================
 
-    if (!ip) {
-      return res.status(400).json({ error: 'IP address is required.' });
-    }
+app.post('/api/admin/ip-ban', requireAdmin, asyncRoute(async (req, res) => {
+  const ip = cleanText(req.body.ip, 100);
+  const reason = cleanText(req.body.reason, 500);
 
-    await pool.query(
-      `INSERT INTO banned_ips (ip, reason)
-       VALUES ($1, $2)
-       ON CONFLICT (ip) DO UPDATE SET reason = EXCLUDED.reason`,
-      [ip, reason]
-    );
+  if (!ip) {
+    return res.status(400).json({
+      error: 'IP address is required.'
+    });
+  }
 
-    res.json({ success: true });
-  })
-);
+  await pool.query(
+    `INSERT INTO banned_ips (ip, reason)
+     VALUES ($1, $2)
+     ON CONFLICT (ip)
+     DO UPDATE SET reason = EXCLUDED.reason`,
+    [ip, reason]
+  );
 
-app.delete('/api/admin/ip-ban/:ip', requireAdmin,
+  return res.json({ success: true });
+}));
+
+app.delete(
+  '/api/admin/ip-ban/:ip',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     await pool.query(
       'DELETE FROM banned_ips WHERE ip = $1',
       [cleanText(req.params.ip, 100)]
     );
-    res.json({ success: true });
+
+    return res.json({ success: true });
   })
 );
 
-// Admin maintenance mode.
-app.post('/api/admin/maintenance', requireAdmin,
+// =========================
+// Maintenance mode
+// =========================
+
+app.post(
+  '/api/admin/maintenance',
+  requireAdmin,
   asyncRoute(async (req, res) => {
     const enabled = req.body.enabled === true;
 
     await pool.query(
       `INSERT INTO site_settings (key, value)
        VALUES ('maintenance', $1)
-       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+       ON CONFLICT (key)
+       DO UPDATE SET value = EXCLUDED.value`,
       [enabled ? 'true' : 'false']
     );
 
-    res.json({ maintenance: enabled });
+    return res.json({ maintenance: enabled });
   })
 );
 
-// Admin stats.
-app.get('/api/admin/stats', requireAdmin,
-  asyncRoute(async (_req, res) => {
-    const [users, posts, banned, maintenance] = await Promise.all([
-      pool.query('SELECT COUNT(*)::int AS count FROM users'),
-      pool.query('SELECT COUNT(*)::int AS count FROM posts'),
-      pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_banned = TRUE'),
-      pool.query(`SELECT value FROM site_settings WHERE key = 'maintenance'`)
-    ]);
+// =========================
+// Admin statistics
+// =========================
 
-    res.json({
-      users: users.rows[0].count,
-      posts: posts.rows[0].count,
-      bannedUsers: banned.rows[0].count,
-      maintenance: maintenance.rows[0]?.value === 'true'
-    });
-  })
-);
+app.get('/api/admin/stats', requireAdmin, asyncRoute(async (_req, res) => {
+  const [users, posts, banned, maintenance] = await Promise.all([
+    pool.query('SELECT COUNT(*)::int AS count FROM users'),
+    pool.query('SELECT COUNT(*)::int AS count FROM posts'),
+    pool.query('SELECT COUNT(*)::int AS count FROM users WHERE is_banned = TRUE'),
+    pool.query(`SELECT value FROM site_settings WHERE key = 'maintenance'`)
+  ]);
 
-// Unknown API endpoint.
+  return res.json({
+    users: users.rows[0].count,
+    posts: posts.rows[0].count,
+    bannedUsers: banned.rows[0].count,
+    maintenance: maintenance.rows[0]?.value === 'true'
+  });
+}));
+
+// Unknown API endpoint
 app.use('/api', (_req, res) => {
-  res.status(404).json({ error: 'API endpoint not found.' });
-});
-
-// Frontend.
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Error handler.
-app.use((err, _req, res, _next) => {
-  console.error(err);
-
-  if (err instanceof multer.MulterError) {
-    return res.status(400).json({ error: err.message });
-  }
-
-  res.status(500).json({
-    error: process.env.NODE_ENV === 'production'
-      ? 'Internal server error.'
-      : err.message
+  return res.status(404).json({
+    error: 'API endpoint not found.'
   });
 });
+
+// Frontend
+app.get('*', (_req, res) => {
+  return res.sendFile(
+    path.join(__dirname, 'public', 'index.html')
+  );
+});
+
+// =========================
+// Error handler
+// =========================
+
+app.use((err, _req, res, _next) => {
+  console.error('Request error:', err);
+
+  // 防止重复发送 HTTP 响应
+  if (res.headersSent) {
+    return;
+  }
+
+  if (err instanceof multer.MulterError) {
+    return res.status(400).json({
+      error: err.message
+    });
+  }
+
+  if (err.message && err.message.startsWith('Only PNG')) {
+    return res.status(400).json({
+      error: err.message
+    });
+  }
+
+  return res.status(500).json({
+    error: isProduction
+      ? 'Internal server error.'
+      : (err.message || 'Unknown error')
+  });
+});
+
+// =========================
+// Start server
+// =========================
 
 initDb()
   .then(() => {
